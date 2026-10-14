@@ -1,0 +1,8 @@
+# Formatting
+uv run ruff format --check
+# Linting
+uv run ruff check
+# Unit Testing
+uv run python -m unittest -b
+# Markdown
+uvx mdlint check
