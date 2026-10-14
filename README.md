@@ -77,6 +77,8 @@ that policy.
 ```shell
 uvcheck
 uvcheck COMMAND [ARGUMENT ...]
+uvcheck --json
+uvcheck --json COMMAND [ARGUMENT ...]
 uvcheck --help
 uvcheck --init
 uvcheck --start
@@ -204,6 +206,13 @@ uvcheck --stop
 Every `uvcheck` command run by the same parent process between these calls is
 included in the final PASS and FAIL counters. `--stop` exits with status 1 if
 any command failed, or status 2 if there is no active session.
+
+Pass `--json` before a single check, or by itself to run the configured checks,
+to emit one JSON object on stdout. Command reports include the argument array,
+`PASS` or `FAIL` status, exit code, elapsed seconds, and captured stdout and
+stderr. Configured-check reports also include a `summary` object with the
+aggregate status, pass/fail counts, and duration. The `--init`, `--start`, and
+`--stop` commands remain human-readable.
 
 ## Behavior
 

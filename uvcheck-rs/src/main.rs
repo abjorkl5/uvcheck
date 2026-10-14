@@ -1,3 +1,4 @@
+use serde_json::{json, Value};
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -10,6 +11,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 const PROGRESS_BYTES: &[u8] = b".FEsxXpr";
 const HELP: &str = r"Usage:
     uvcheck
+    uvcheck --json [COMMAND [ARGUMENT ...]]
     uvcheck COMMAND [ARGUMENT ...]
 
 Options:
@@ -17,6 +19,7 @@ Options:
     --init      Create the configuration file
     --start     Start a shared check session
     --stop      Stop a shared check session and print its summary
+    --json      Emit JSON output for check runs
 ";
 
 #[derive(Debug)]
@@ -192,6 +195,39 @@ fn stop_session() -> io::Result<i32> {
         state.passed, state.failed
     );
     Ok(returncode)
+}
+
+fn stop_session_json(commands: Option<Vec<Value>>) -> io::Result<i32> {
+    let path = state_file();
+    let mut file = match File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            println!("{}", json!({"error": "no active session", "exit_code": 2}));
+            return Ok(2);
+        }
+        Err(error) => return Err(error),
+    };
+    lock(&file)?;
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)?;
+    let state = State::parse(&contents)?;
+    fs::remove_file(path)?;
+
+    let elapsed = now_ns()?.saturating_sub(state.started_at) as f64 / 1_000_000_000.0;
+    let status = if state.failed == 0 { "PASS" } else { "FAIL" };
+    let mut report = json!({
+        "summary": {
+            "status": status,
+            "passed": state.passed,
+            "failed": state.failed,
+            "duration_seconds": elapsed
+        }
+    });
+    if let Some(commands) = commands {
+        report["commands"] = json!(commands);
+    }
+    println!("{report}");
+    Ok(if state.failed == 0 { 0 } else { 1 })
 }
 
 #[cfg(test)]
@@ -540,6 +576,29 @@ fn run(runner: &[String], command: &[String]) -> io::Result<i32> {
     Ok(returncode)
 }
 
+fn run_json(runner: &[String], command: &[String]) -> io::Result<(i32, Value)> {
+    let started = Instant::now();
+    let output = Command::new(&runner[0])
+        .args(&runner[1..])
+        .args(command)
+        .env("NO_COLOR", "1")
+        .output()?;
+    let returncode = output.status.code().unwrap_or(1);
+    let status = if returncode == 0 { "PASS" } else { "FAIL" };
+    update_session(returncode)?;
+    Ok((
+        returncode,
+        json!({
+            "command": runner.iter().chain(command).collect::<Vec<_>>(),
+            "status": status,
+            "exit_code": returncode,
+            "duration_seconds": started.elapsed().as_secs_f64(),
+            "stdout": String::from_utf8_lossy(&output.stdout),
+            "stderr": String::from_utf8_lossy(&output.stderr)
+        }),
+    ))
+}
+
 fn run_all() -> io::Result<i32> {
     let commands = configured_commands()?;
     start_session()?;
@@ -549,13 +608,31 @@ fn run_all() -> io::Result<i32> {
     stop_session()
 }
 
+fn run_all_json() -> io::Result<i32> {
+    let commands = configured_commands()?;
+    start_session()?;
+    let mut results = Vec::new();
+    for (runner, command) in commands {
+        let (_, result) = run_json(&runner, &command)?;
+        results.push(result);
+    }
+    stop_session_json(Some(results))
+}
+
 fn print_help() {
     print!("{HELP}");
 }
 
 fn main() -> ExitCode {
-    let arguments: Vec<String> = env::args().skip(1).collect();
+    let mut arguments: Vec<String> = env::args().skip(1).collect();
+    let json_output = arguments
+        .first()
+        .is_some_and(|argument| argument == "--json");
+    if json_output {
+        arguments.remove(0);
+    }
     let result = match arguments.as_slice() {
+        [] if json_output => run_all_json(),
         [] => run_all(),
         [argument] if argument == "--help" || argument == "-h" => {
             print_help();
@@ -564,13 +641,23 @@ fn main() -> ExitCode {
         [argument] if argument == "--init" => init_config().map(|()| 0),
         [argument] if argument == "--start" => start_session().map(|()| 0),
         [argument] if argument == "--stop" => stop_session(),
+        command if json_output => {
+            run_json(&["uv".to_string(), "run".to_string()], command).map(|(returncode, report)| {
+                println!("{report}");
+                returncode
+            })
+        }
         command => run(&["uv".to_string(), "run".to_string()], command),
     };
 
     match result {
         Ok(returncode) => ExitCode::from(returncode as u8),
         Err(error) => {
-            eprintln!("uvcheck: {error}");
+            if json_output {
+                println!("{}", json!({"error": error.to_string(), "exit_code": 2}));
+            } else {
+                eprintln!("uvcheck: {error}");
+            }
             ExitCode::from(2)
         }
     }

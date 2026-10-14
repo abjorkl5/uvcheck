@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import tempfile
@@ -52,6 +53,40 @@ class UvcheckTest(unittest.TestCase):
 
         self.assertEqual(stopped.returncode, 2)
         self.assertEqual(stopped.stderr, "uvcheck: no active session\n")
+
+    def test_json_command_report_captures_output_and_status(self) -> None:
+        result = self.run_uvcheck(
+            "--json",
+            "python",
+            "-c",
+            "import sys; print('ok'); print('note', file=sys.stderr)",
+        )
+
+        self.assertEqual(result.returncode, 0)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["status"], "PASS")
+        self.assertEqual(report["exit_code"], 0)
+        self.assertEqual(report["stdout"], "ok\n")
+        self.assertEqual(report["stderr"], "note\n")
+
+    def test_json_failed_command_preserves_exit_code(self) -> None:
+        result = self.run_uvcheck("--json", "python", "-c", "raise SystemExit(3)")
+
+        self.assertEqual(result.returncode, 3)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["status"], "FAIL")
+        self.assertEqual(report["exit_code"], 3)
+
+    def test_json_configured_report_includes_command_results_and_summary(self) -> None:
+        self.config_file.write_text("python -c 'print(\"configured\")'\n", encoding="utf-8")
+
+        result = self.run_uvcheck("--json")
+
+        self.assertEqual(result.returncode, 0)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["commands"][0]["stdout"], "configured\n")
+        self.assertEqual(report["summary"]["status"], "PASS")
+        self.assertEqual(report["summary"]["passed"], 1)
 
     def test_help_flags_print_usage_and_succeed(self) -> None:
         for flag in ("--help", "-h"):

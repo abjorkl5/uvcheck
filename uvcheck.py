@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import fcntl
+import json
 import os
 import re
 import selectors
@@ -33,6 +34,7 @@ CONFIG_RUNNERS = (["uv", "run"], ["uvx"], ["uv", "tool", "run"])
 HELP = """\
 Usage:
   uvcheck
+  uvcheck --json [COMMAND [ARGUMENT ...]]
   uvcheck COMMAND [ARGUMENT ...]
 
 Options:
@@ -40,6 +42,7 @@ Options:
   --init      Create the configuration file
   --start     Start a shared check session
   --stop      Stop a shared check session and print its summary
+  --json      Emit JSON output for check runs
 """
 
 
@@ -91,20 +94,35 @@ def update_session(returncode: int) -> None:
         pass
 
 
-def stop_session() -> int:
+def stop_session(*, json_output: bool = False, commands: list[dict[str, object]] | None = None) -> int:
     try:
         with STATE_FILE.open(encoding="utf-8") as state_file:
             fcntl.flock(state_file, fcntl.LOCK_EX)
             started_at, passed, failed = read_state(state_file)
             STATE_FILE.unlink()
     except FileNotFoundError:
+        if json_output:
+            print(json.dumps({"error": "no active session", "exit_code": 2}))
+            return 2
         print("uvcheck: no active session", file=sys.stderr)
         return 2
 
     elapsed = (time.time_ns() - started_at) / 1_000_000_000
     status = "PASS" if failed == 0 else "FAIL"
-    colored_status = colorize_status(status)
-    print(f"\n{colored_status} ({passed} PASS, {failed} FAIL) in {elapsed:.2f}s")
+    summary = {
+        "status": status,
+        "passed": passed,
+        "failed": failed,
+        "duration_seconds": elapsed,
+    }
+    if json_output:
+        report: dict[str, object] = {"summary": summary}
+        if commands is not None:
+            report["commands"] = commands
+        print(json.dumps(report))
+    else:
+        colored_status = colorize_status(status)
+        print(f"\n{colored_status} ({passed} PASS, {failed} FAIL) in {elapsed:.2f}s")
     return 0 if failed == 0 else 1
 
 
@@ -138,16 +156,22 @@ def init_config() -> int:
     return 0
 
 
-def run_all() -> int:
+def run_all(*, json_output: bool = False) -> int:
     has_explicit_config = "UVCHECK_CONFIG_FILE" in os.environ
     try:
         lines = CONFIG_FILE.read_text(encoding="utf-8").splitlines()
     except FileNotFoundError:
         if has_explicit_config:
+            if json_output:
+                print(json.dumps({"error": f"configuration not found: {CONFIG_FILE}", "exit_code": 2}))
+                return 2
             print(f"uvcheck: configuration not found: {CONFIG_FILE}", file=sys.stderr)
             return 2
         commands = default_commands()
     except OSError as error:
+        if json_output:
+            print(json.dumps({"error": f"{CONFIG_FILE}: {error}", "exit_code": 2}))
+            return 2
         print(f"uvcheck: {CONFIG_FILE}: {error}", file=sys.stderr)
         return 2
     else:
@@ -172,9 +196,12 @@ def run_all() -> int:
             commands.append((runner, command[command_start:]))
 
     start_session()
+    results = []
     for runner, command in commands:
-        run(command, runner)
-    return stop_session()
+        _, result = run(command, runner, json_output=json_output)
+        if result is not None:
+            results.append(result)
+    return stop_session(json_output=json_output, commands=results if json_output else None)
 
 
 PROGRESS_CHARS = b".FEsxXpr"
@@ -316,15 +343,24 @@ def print_test_summary(stdout: str, stderr: str, returncode: int, is_pytest: boo
         print(f"{test_status.group(1)} - {test_summary.group(0)}")
 
 
-def run(command: Sequence[str], runner: Sequence[str] = DEFAULT_RUNNER) -> int:
+def run(
+    command: Sequence[str],
+    runner: Sequence[str] = DEFAULT_RUNNER,
+    *,
+    json_output: bool = False,
+) -> tuple[int, dict[str, object] | None]:
     started = time.perf_counter()
     is_unittest = is_unittest_command(command)
     is_pytest = is_pytest_command(command)
     is_tracked = is_unittest or is_pytest
     environment = os.environ | {"NO_COLOR": "1"}
-    print(f"+ {shlex.join(runner)} {shlex.join(command)}", flush=True)
+    if not json_output:
+        print(f"+ {shlex.join(runner)} {shlex.join(command)}", flush=True)
 
-    if is_tracked:
+    if json_output:
+        completed = subprocess.run([*runner, *command], check=False, capture_output=True, text=True, env=environment)
+        stdout, stderr, returncode = completed.stdout, completed.stderr, completed.returncode
+    elif is_tracked:
         progress_stream = "stderr" if is_unittest else "stdout"
         stdout, stderr, returncode, progress_started = run_with_progress(command, runner, environment, progress_stream)
     else:
@@ -334,30 +370,49 @@ def run(command: Sequence[str], runner: Sequence[str] = DEFAULT_RUNNER) -> int:
     elapsed = time.perf_counter() - started
     status = "PASS" if returncode == 0 else "FAIL"
 
-    if is_tracked:
+    if is_tracked and not json_output:
         if progress_started:
             clear_progress_line()
         print_test_summary(stdout, stderr, returncode, is_pytest)
 
-    result = f"{colorize_status(status)} {' '.join(command)} ({elapsed:.2f}s)"
-    print(result)
+    result = (
+        {
+            "command": [*runner, *command],
+            "status": status,
+            "exit_code": returncode,
+            "duration_seconds": elapsed,
+            "stdout": stdout if json_output else "",
+            "stderr": stderr if json_output else "",
+        }
+        if json_output
+        else None
+    )
+    if not json_output:
+        print(f"{colorize_status(status)} {' '.join(command)} ({elapsed:.2f}s)")
     update_session(returncode)
-    return returncode
+    return returncode, result
 
 
 def main() -> int:
-    if len(sys.argv) < 2:
-        return run_all()
-    if sys.argv[1:] in (["--help"], ["-h"]):
+    arguments = sys.argv[1:]
+    json_output = arguments[:1] == ["--json"]
+    if json_output:
+        arguments = arguments[1:]
+    if not arguments:
+        return run_all(json_output=json_output)
+    if arguments in (["--help"], ["-h"]):
         print(HELP, end="")
         return 0
-    if sys.argv[1:] == ["--init"]:
+    if arguments == ["--init"]:
         return init_config()
-    if sys.argv[1:] == ["--start"]:
+    if arguments == ["--start"]:
         return start_session()
-    if sys.argv[1:] == ["--stop"]:
+    if arguments == ["--stop"]:
         return stop_session()
-    return run(sys.argv[1:])
+    returncode, result = run(arguments, json_output=json_output)
+    if result is not None and json_output:
+        print(json.dumps(result))
+    return returncode
 
 
 if __name__ == "__main__":
