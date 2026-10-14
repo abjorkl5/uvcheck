@@ -79,6 +79,7 @@ uvcheck
 uvcheck COMMAND [ARGUMENT ...]
 uvcheck --json
 uvcheck --json COMMAND [ARGUMENT ...]
+uvcheck --json --junit-xml REPORT.xml [COMMAND [ARGUMENT ...]]
 uvcheck --help
 uvcheck --init
 uvcheck --start
@@ -213,6 +214,14 @@ to emit one JSON object on stdout. Command reports include the argument array,
 stderr. Configured-check reports also include a `summary` object with the
 aggregate status, pass/fail counts, and duration. The `--init`, `--start`, and
 `--stop` commands remain human-readable.
+
+Pass `--json --junit-xml PATH` to write a JUnit XML report to a file while
+running the configured checks, or place a command after the path to report a
+single check. `--junit-xml` requires `--json`.
+Each command is represented by a testcase with its duration, captured stdout
+and stderr, and a failure entry for nonzero exit codes. The suite timestamp is
+UTC in ISO-8601 format. JSON is emitted on stdout, and the command's exit
+status remains unchanged.
 
 ## Behavior
 

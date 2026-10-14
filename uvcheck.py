@@ -13,7 +13,9 @@ import subprocess
 import sys
 import tempfile
 import time
+import xml.etree.ElementTree as ET
 from collections.abc import Sequence
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TextIO
 
@@ -35,6 +37,7 @@ HELP = """\
 Usage:
   uvcheck
   uvcheck --json [COMMAND [ARGUMENT ...]]
+  uvcheck --json --junit-xml PATH [COMMAND [ARGUMENT ...]]
   uvcheck COMMAND [ARGUMENT ...]
 
 Options:
@@ -43,6 +46,7 @@ Options:
   --start     Start a shared check session
   --stop      Stop a shared check session and print its summary
   --json      Emit JSON output for check runs
+  --junit-xml PATH  Write a JUnit XML report to PATH (requires --json)
 """
 
 
@@ -136,7 +140,7 @@ def default_config() -> str:
         "uv run ruff format --check\n"
         "# Linting\n"
         "uv run ruff check\n"
-        "# Unit Testing\n"
+        "# Unit tests\n"
         "uv run python -m unittest -b\n"
     )
 
@@ -156,7 +160,60 @@ def init_config() -> int:
     return 0
 
 
-def run_all(*, json_output: bool = False) -> int:
+def junit_timestamp() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def junit_xml_report(results: list[dict[str, object]], timestamp: str) -> bytes:
+    tests = len(results)
+    failures = sum(result["status"] == "FAIL" for result in results)
+    elapsed = sum(float(result["duration_seconds"]) for result in results)
+    attributes = {
+        "name": "uvcheck",
+        "tests": str(tests),
+        "failures": str(failures),
+        "errors": "0",
+        "time": f"{elapsed:.6f}",
+        "timestamp": timestamp,
+    }
+    suites = ET.Element("testsuites", attributes)
+    suite = ET.SubElement(suites, "testsuite", attributes)
+    for result in results:
+        command = result["command"]
+        assert isinstance(command, list)
+        case = ET.SubElement(
+            suite,
+            "testcase",
+            {
+                "classname": "uvcheck",
+                "name": shlex.join(command),
+                "time": f"{float(result['duration_seconds']):.6f}",
+            },
+        )
+        if result["status"] == "FAIL":
+            failure = ET.SubElement(
+                case,
+                "failure",
+                {"message": f"Command failed with exit code {result['exit_code']}"},
+            )
+            failure.text = f"Command failed with exit code {result['exit_code']}"
+        for key, tag in (("stdout", "system-out"), ("stderr", "system-err")):
+            output = result[key]
+            if output:
+                ET.SubElement(case, tag).text = str(output)
+    return ET.tostring(suites, encoding="utf-8", xml_declaration=True)
+
+
+def write_junit_xml(path: Path, results: list[dict[str, object]], timestamp: str) -> int:
+    try:
+        path.write_bytes(junit_xml_report(results, timestamp))
+    except OSError as error:
+        print(f"uvcheck: {path}: {error}", file=sys.stderr)
+        return 2
+    return 0
+
+
+def run_all(*, json_output: bool = False, xml_path: Path | None = None) -> int:
     has_explicit_config = "UVCHECK_CONFIG_FILE" in os.environ
     try:
         lines = CONFIG_FILE.read_text(encoding="utf-8").splitlines()
@@ -195,13 +252,19 @@ def run_all(*, json_output: bool = False) -> int:
             command_start = len(runner) if explicit_runner is not None else 0
             commands.append((runner, command[command_start:]))
 
+    xml_timestamp = junit_timestamp() if xml_path is not None else None
     start_session()
     results = []
     for runner, command in commands:
-        _, result = run(command, runner, json_output=json_output)
+        _, result = run(command, runner, json_output=json_output, xml_output=xml_path is not None)
         if result is not None:
             results.append(result)
-    return stop_session(json_output=json_output, commands=results if json_output else None)
+    status = stop_session(json_output=json_output, commands=results if json_output else None)
+    if xml_path is not None:
+        assert xml_timestamp is not None
+        if write_junit_xml(xml_path, results, xml_timestamp) != 0:
+            return 2
+    return status
 
 
 PROGRESS_CHARS = b".FEsxXpr"
@@ -348,6 +411,7 @@ def run(
     runner: Sequence[str] = DEFAULT_RUNNER,
     *,
     json_output: bool = False,
+    xml_output: bool = False,
 ) -> tuple[int, dict[str, object] | None]:
     started = time.perf_counter()
     is_unittest = is_unittest_command(command)
@@ -357,7 +421,7 @@ def run(
     if not json_output:
         print(f"+ {shlex.join(runner)} {shlex.join(command)}", flush=True)
 
-    if json_output:
+    if json_output or xml_output:
         completed = subprocess.run([*runner, *command], check=False, capture_output=True, text=True, env=environment)
         stdout, stderr, returncode = completed.stdout, completed.stderr, completed.returncode
     elif is_tracked:
@@ -370,7 +434,12 @@ def run(
     elapsed = time.perf_counter() - started
     status = "PASS" if returncode == 0 else "FAIL"
 
-    if is_tracked and not json_output:
+    if xml_output and not json_output:
+        if stdout:
+            print(stdout, end="", file=sys.stdout)
+        if stderr:
+            print(stderr, end="", file=sys.stderr)
+    if is_tracked and not json_output and not xml_output:
         if progress_started:
             clear_progress_line()
         print_test_summary(stdout, stderr, returncode, is_pytest)
@@ -398,8 +467,18 @@ def main() -> int:
     json_output = arguments[:1] == ["--json"]
     if json_output:
         arguments = arguments[1:]
+    xml_path = None
+    if arguments[:1] == ["--junit-xml"]:
+        if len(arguments) < 2:
+            print("uvcheck: --junit-xml requires a PATH", file=sys.stderr)
+            return 2
+        xml_path = Path(arguments[1])
+        arguments = arguments[2:]
+    if xml_path is not None and not json_output:
+        print("uvcheck: --junit-xml requires --json", file=sys.stderr)
+        return 2
     if not arguments:
-        return run_all(json_output=json_output)
+        return run_all(json_output=json_output, xml_path=xml_path)
     if arguments in (["--help"], ["-h"]):
         print(HELP, end="")
         return 0
@@ -409,8 +488,13 @@ def main() -> int:
         return start_session()
     if arguments == ["--stop"]:
         return stop_session()
-    returncode, result = run(arguments, json_output=json_output)
-    if result is not None and json_output:
+    xml_timestamp = junit_timestamp() if xml_path is not None else None
+    returncode, result = run(arguments, json_output=json_output, xml_output=xml_path is not None)
+    if xml_path is not None and result is not None:
+        assert xml_timestamp is not None
+        if write_junit_xml(xml_path, [result], xml_timestamp) != 0:
+            return 2
+    if result is not None and (xml_path is None or json_output):
         print(json.dumps(result))
     return returncode
 

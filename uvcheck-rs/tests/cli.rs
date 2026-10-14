@@ -150,3 +150,123 @@ fn json_configured_report_includes_command_results_and_summary() {
     fs::remove_file(config_file).expect("failed to remove test configuration");
 }
 
+#[test]
+fn junit_xml_configured_report_includes_logs_and_failures() {
+    let state_file = temporary_path("state");
+    let config_file = temporary_path("config");
+    let report_file = temporary_path("junit.xml");
+    fs::write(
+        &config_file,
+        "python -c 'print(\"<configured>\")'\n\
+         python -c 'import sys; print(\"bad & broken\", file=sys.stderr); raise SystemExit(3)'\n",
+    )
+    .expect("failed to write test configuration");
+
+    let completed = run_uvcheck(
+        &state_file,
+        &config_file,
+        &["--json", "--junit-xml", report_file.to_str().unwrap()],
+    );
+    let xml = fs::read_to_string(&report_file).expect("failed to read JUnit report");
+    let mut reader = quick_xml::Reader::from_str(&xml);
+    loop {
+        match reader.read_event() {
+            Ok(quick_xml::events::Event::Eof) => break,
+            Ok(_) => {}
+            Err(error) => panic!("invalid JUnit XML: {error}"),
+        }
+    }
+    assert_eq!(completed.status.code(), Some(1));
+    assert!(xml.contains("tests=\"2\""));
+    assert!(xml.contains("failures=\"1\""));
+    assert!(xml.contains("errors=\"0\""));
+    let timestamps = xml
+        .match_indices("timestamp=\"")
+        .map(|(start, _)| {
+            xml[start + "timestamp=\"".len()..]
+                .split('\"')
+                .next()
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(timestamps.len(), 2);
+    assert_eq!(timestamps[0], timestamps[1]);
+    assert!(timestamps[0].ends_with('Z'));
+    assert!(xml.contains("<system-out>&lt;configured&gt;"));
+    assert!(xml.contains("<failure message=\"Command failed with exit code 3\">"));
+    assert!(xml.contains("bad &amp; broken"));
+
+    fs::remove_file(config_file).expect("failed to remove test configuration");
+    fs::remove_file(report_file).expect("failed to remove JUnit report");
+}
+
+#[test]
+fn junit_xml_single_command_writes_a_report_file() {
+    let state_file = temporary_path("state");
+    let config_file = temporary_path("config");
+    let report_file = temporary_path("single.xml");
+
+    let completed = run_uvcheck(
+        &state_file,
+        &config_file,
+        &[
+            "--json",
+            "--junit-xml",
+            report_file.to_str().unwrap(),
+            "python",
+            "-c",
+            "print('single')",
+        ],
+    );
+
+    assert!(completed.status.success());
+    let xml = fs::read_to_string(&report_file).expect("failed to read JUnit report");
+    assert!(xml.contains("tests=\"1\""));
+    assert!(xml.contains("<system-out>single"));
+    fs::remove_file(report_file).expect("failed to remove JUnit report");
+}
+
+#[test]
+fn json_and_junit_xml_write_to_separate_outputs() {
+    let state_file = temporary_path("state");
+    let config_file = temporary_path("config");
+    let report_file = temporary_path("combined.xml");
+
+    let completed = run_uvcheck(
+        &state_file,
+        &config_file,
+        &[
+            "--json",
+            "--junit-xml",
+            report_file.to_str().unwrap(),
+            "python",
+            "-c",
+            "print('combined')",
+        ],
+    );
+
+    let report: serde_json::Value = serde_json::from_slice(&completed.stdout).unwrap();
+    assert!(completed.status.success());
+    assert_eq!(report["stdout"], "combined\n");
+    let xml = fs::read_to_string(&report_file).expect("failed to read JUnit report");
+    assert!(xml.contains("errors=\"0\""));
+    assert!(xml.contains("<system-out>combined"));
+    fs::remove_file(report_file).expect("failed to remove JUnit report");
+}
+
+#[test]
+fn junit_xml_requires_json_output_mode() {
+    let state_file = temporary_path("state");
+    let config_file = temporary_path("config");
+    let report_file = temporary_path("junit.xml");
+
+    let completed = run_uvcheck(
+        &state_file,
+        &config_file,
+        &["--junit-xml", report_file.to_str().unwrap()],
+    );
+
+    assert_eq!(completed.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&completed.stderr).contains("--junit-xml requires --json"));
+    assert!(!report_file.exists());
+}

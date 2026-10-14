@@ -1,9 +1,12 @@
+use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
+use quick_xml::Writer;
 use serde_json::{json, Value};
 use std::env;
+use std::ffi::CStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::thread;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -12,6 +15,7 @@ const PROGRESS_BYTES: &[u8] = b".FEsxXpr";
 const HELP: &str = r"Usage:
     uvcheck
     uvcheck --json [COMMAND [ARGUMENT ...]]
+    uvcheck --json --junit-xml PATH [COMMAND [ARGUMENT ...]]
     uvcheck COMMAND [ARGUMENT ...]
 
 Options:
@@ -20,6 +24,7 @@ Options:
     --start     Start a shared check session
     --stop      Stop a shared check session and print its summary
     --json      Emit JSON output for check runs
+    --junit-xml PATH  Write a JUnit XML report to PATH (requires --json)
 ";
 
 #[derive(Debug)]
@@ -599,6 +604,146 @@ fn run_json(runner: &[String], command: &[String]) -> io::Result<(i32, Value)> {
     ))
 }
 
+fn write_xml_text(writer: &mut Writer<Vec<u8>>, name: &str, text: &str) -> io::Result<()> {
+    writer.write_event(Event::Start(BytesStart::new(name)))?;
+    writer.write_event(Event::Text(BytesText::new(text)))?;
+    writer.write_event(Event::End(BytesEnd::new(name)))
+}
+
+fn junit_timestamp() -> io::Result<String> {
+    let seconds = unsafe { libc::time(std::ptr::null_mut()) };
+    if seconds == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut broken_down = std::mem::MaybeUninit::<libc::tm>::uninit();
+    let broken_down = unsafe { libc::gmtime_r(&seconds, broken_down.as_mut_ptr()) };
+    if broken_down.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let format = b"%Y-%m-%dT%H:%M:%SZ\0";
+    let mut buffer = [0 as libc::c_char; 32];
+    let length = unsafe {
+        libc::strftime(
+            buffer.as_mut_ptr(),
+            buffer.len(),
+            format.as_ptr().cast(),
+            broken_down,
+        )
+    };
+    if length == 0 {
+        return Err(io::Error::other("failed to format JUnit timestamp"));
+    }
+    Ok(unsafe { CStr::from_ptr(buffer.as_ptr()) }
+        .to_string_lossy()
+        .into_owned())
+}
+
+fn junit_xml_report(results: &[Value], timestamp: &str) -> io::Result<Vec<u8>> {
+    let tests = results.len().to_string();
+    let failures = results
+        .iter()
+        .filter(|result| result["status"] == "FAIL")
+        .count()
+        .to_string();
+    let elapsed = results
+        .iter()
+        .map(|result| result["duration_seconds"].as_f64().unwrap_or(0.0))
+        .sum::<f64>();
+    let elapsed = format!("{elapsed:.6}");
+    let mut writer = Writer::new_with_indent(Vec::new(), b' ', 2);
+    writer.write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), None)))?;
+
+    let mut suites = BytesStart::new("testsuites");
+    suites.push_attribute(("name", "uvcheck"));
+    suites.push_attribute(("tests", tests.as_str()));
+    suites.push_attribute(("failures", failures.as_str()));
+    suites.push_attribute(("errors", "0"));
+    suites.push_attribute(("time", elapsed.as_str()));
+    suites.push_attribute(("timestamp", timestamp));
+    writer.write_event(Event::Start(suites))?;
+
+    let mut suite = BytesStart::new("testsuite");
+    suite.push_attribute(("name", "uvcheck"));
+    suite.push_attribute(("tests", tests.as_str()));
+    suite.push_attribute(("failures", failures.as_str()));
+    suite.push_attribute(("errors", "0"));
+    suite.push_attribute(("time", elapsed.as_str()));
+    suite.push_attribute(("timestamp", timestamp));
+    writer.write_event(Event::Start(suite))?;
+
+    for result in results {
+        let command = result["command"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let command = display_command(&command);
+        let escaped_command = quick_xml::escape::escape(&command);
+        let duration = format!("{:.6}", result["duration_seconds"].as_f64().unwrap_or(0.0));
+        let mut testcase = BytesStart::new("testcase");
+        testcase.push_attribute(("classname", "uvcheck"));
+        testcase.push_attribute(("name", escaped_command.as_ref()));
+        testcase.push_attribute(("time", duration.as_str()));
+        writer.write_event(Event::Start(testcase))?;
+
+        let exit_code = result["exit_code"].as_i64().unwrap_or(1);
+        if exit_code != 0 {
+            let message = format!("Command failed with exit code {exit_code}");
+            let mut failure = BytesStart::new("failure");
+            failure.push_attribute(("message", message.as_str()));
+            writer.write_event(Event::Start(failure))?;
+            writer.write_event(Event::Text(BytesText::new(&message)))?;
+            writer.write_event(Event::End(BytesEnd::new("failure")))?;
+        }
+        for (key, tag) in [("stdout", "system-out"), ("stderr", "system-err")] {
+            if let Some(output) = result[key].as_str().filter(|output| !output.is_empty()) {
+                write_xml_text(&mut writer, tag, output)?;
+            }
+        }
+        writer.write_event(Event::End(BytesEnd::new("testcase")))?;
+    }
+
+    writer.write_event(Event::End(BytesEnd::new("testsuite")))?;
+    writer.write_event(Event::End(BytesEnd::new("testsuites")))?;
+    Ok(writer.into_inner())
+}
+
+fn print_xml_command(runner: &[String], command: &[String], result: &Value) {
+    println!("+ {} {}", display_command(runner), display_command(command));
+    if let Some(stdout) = result["stdout"].as_str() {
+        print!("{stdout}");
+    }
+    if let Some(stderr) = result["stderr"].as_str() {
+        eprint!("{stderr}");
+    }
+    let status = result["status"].as_str().unwrap_or("FAIL");
+    let duration = result["duration_seconds"].as_f64().unwrap_or(0.0);
+    println!(
+        "{} {} ({duration:.2}s)",
+        colorize_status(status),
+        display_command(command)
+    );
+}
+
+fn run_xml(
+    runner: &[String],
+    command: &[String],
+    path: &Path,
+    json_output: bool,
+) -> io::Result<i32> {
+    let timestamp = junit_timestamp()?;
+    let (returncode, result) = run_json(runner, command)?;
+    if json_output {
+        println!("{result}");
+    } else {
+        print_xml_command(runner, command, &result);
+    }
+    fs::write(path, junit_xml_report(&[result], &timestamp)?)?;
+    Ok(returncode)
+}
+
 fn run_all() -> io::Result<i32> {
     let commands = configured_commands()?;
     start_session()?;
@@ -619,6 +764,27 @@ fn run_all_json() -> io::Result<i32> {
     stop_session_json(Some(results))
 }
 
+fn run_all_xml(path: &Path, json_output: bool) -> io::Result<i32> {
+    let timestamp = junit_timestamp()?;
+    let commands = configured_commands()?;
+    start_session()?;
+    let mut results = Vec::new();
+    for (runner, command) in commands {
+        let (_, result) = run_json(&runner, &command)?;
+        if !json_output {
+            print_xml_command(&runner, &command, &result);
+        }
+        results.push(result);
+    }
+    let status = if json_output {
+        stop_session_json(Some(results.clone()))?
+    } else {
+        stop_session()?
+    };
+    fs::write(path, junit_xml_report(&results, &timestamp)?)?;
+    Ok(status)
+}
+
 fn print_help() {
     print!("{HELP}");
 }
@@ -631,7 +797,27 @@ fn main() -> ExitCode {
     if json_output {
         arguments.remove(0);
     }
+    let junit_xml_path = if arguments
+        .first()
+        .is_some_and(|argument| argument == "--junit-xml")
+    {
+        if arguments.len() < 2 {
+            eprintln!("uvcheck: --junit-xml requires a PATH");
+            return ExitCode::from(2);
+        }
+        let path = PathBuf::from(arguments.remove(1));
+        arguments.remove(0);
+        Some(path)
+    } else {
+        None
+    };
+    if junit_xml_path.is_some() && !json_output {
+        eprintln!("uvcheck: --junit-xml requires --json");
+        return ExitCode::from(2);
+    }
+    let junit_xml_output = junit_xml_path.is_some();
     let result = match arguments.as_slice() {
+        [] if junit_xml_output => run_all_xml(junit_xml_path.as_deref().unwrap(), json_output),
         [] if json_output => run_all_json(),
         [] => run_all(),
         [argument] if argument == "--help" || argument == "-h" => {
@@ -641,6 +827,12 @@ fn main() -> ExitCode {
         [argument] if argument == "--init" => init_config().map(|()| 0),
         [argument] if argument == "--start" => start_session().map(|()| 0),
         [argument] if argument == "--stop" => stop_session(),
+        command if junit_xml_output => run_xml(
+            &["uv".to_string(), "run".to_string()],
+            command,
+            junit_xml_path.as_deref().unwrap(),
+            json_output,
+        ),
         command if json_output => {
             run_json(&["uv".to_string(), "run".to_string()], command).map(|(returncode, report)| {
                 println!("{report}");
@@ -682,6 +874,7 @@ mod tests {
         assert!(HELP.contains("--init"));
         assert!(HELP.contains("--start"));
         assert!(HELP.contains("--stop"));
+        assert!(HELP.contains("--json --junit-xml PATH"));
     }
 
     #[test]

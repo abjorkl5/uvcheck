@@ -7,6 +7,7 @@ import os
 import subprocess
 import tempfile
 import unittest
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import uvcheck
@@ -88,6 +89,75 @@ class UvcheckTest(unittest.TestCase):
         self.assertEqual(report["summary"]["status"], "PASS")
         self.assertEqual(report["summary"]["passed"], 1)
 
+    def test_xml_configured_report_includes_logs_and_failures(self) -> None:
+        self.config_file.write_text(
+            "python -c 'print(\"<configured>\")'\n"
+            "python -c 'import sys; print(\"bad & broken\", file=sys.stderr); raise SystemExit(3)'\n",
+            encoding="utf-8",
+        )
+        report_path = self.config_file.parent / "junit.xml"
+
+        result = self.run_uvcheck("--json", "--junit-xml", str(report_path))
+
+        report = ET.parse(report_path).getroot()
+        self.assertEqual(result.returncode, 1)
+        json_report = json.loads(result.stdout)
+        self.assertEqual(json_report["summary"]["failed"], 1)
+        self.assertEqual(report.attrib["tests"], "2")
+        self.assertEqual(report.attrib["failures"], "1")
+        self.assertEqual(report.attrib["errors"], "0")
+        self.assertRegex(report.attrib["timestamp"], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+        self.assertEqual(report.find("testsuite").attrib["errors"], "0")
+        self.assertEqual(report.find("testsuite").attrib["timestamp"], report.attrib["timestamp"])
+        cases = report.findall("./testsuite/testcase")
+        self.assertEqual(cases[0].findtext("system-out"), "<configured>\n")
+        self.assertEqual(cases[1].find("failure").attrib["message"], "Command failed with exit code 3")
+        self.assertEqual(cases[1].findtext("system-err"), "bad & broken\n")
+
+    def test_xml_single_command_writes_a_junit_report(self) -> None:
+        report_path = self.config_file.parent / "single.xml"
+
+        result = self.run_uvcheck("--json", "--junit-xml", str(report_path), "python", "-c", "print('single')")
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(json.loads(result.stdout)["stdout"], "single\n")
+        report = ET.parse(report_path).getroot()
+        self.assertEqual(report.attrib["tests"], "1")
+        self.assertEqual(report.findtext("./testsuite/testcase/system-out"), "single\n")
+
+    def test_xml_requires_a_report_path(self) -> None:
+        result = self.run_uvcheck("--json", "--junit-xml")
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("--junit-xml requires a PATH", result.stderr)
+
+    def test_junit_xml_requires_json_output_mode(self) -> None:
+        report_path = self.config_file.parent / "junit.xml"
+
+        result = self.run_uvcheck("--junit-xml", str(report_path))
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("--junit-xml requires --json", result.stderr)
+        self.assertFalse(report_path.exists())
+
+    def test_json_and_junit_xml_write_to_separate_outputs(self) -> None:
+        report_path = self.config_file.parent / "combined.xml"
+        result = self.run_uvcheck(
+            "--json",
+            "--junit-xml",
+            str(report_path),
+            "python",
+            "-c",
+            "print('combined')",
+        )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(json.loads(result.stdout)["stdout"], "combined\n")
+        self.assertEqual(
+            ET.parse(report_path).getroot().findtext("./testsuite/testcase/system-out"),
+            "combined\n",
+        )
+
     def test_help_flags_print_usage_and_succeed(self) -> None:
         for flag in ("--help", "-h"):
             with self.subTest(flag=flag):
@@ -98,6 +168,7 @@ class UvcheckTest(unittest.TestCase):
                 self.assertIn("--init", result.stdout)
                 self.assertIn("--start", result.stdout)
                 self.assertIn("--stop", result.stdout)
+                self.assertIn("--junit-xml PATH", result.stdout)
 
     def test_status_colors_respect_tty_and_no_color(self) -> None:
         self.assertEqual(
