@@ -2,6 +2,8 @@
 uv run ruff format --check
 # Linting
 uv run ruff check
+# Typing
+uvx ty check
 # Unit Testing
 uv run python -m unittest -b
 # Markdown

@@ -17,7 +17,10 @@ import xml.etree.ElementTree as ET
 from collections.abc import Sequence
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TextIO
+from typing import Literal, TextIO
+
+Status = Literal["PASS", "FAIL"]
+
 
 STATE_FILE = Path(
     os.environ.get(
@@ -112,8 +115,8 @@ def stop_session(*, json_output: bool = False, commands: list[dict[str, object]]
         return 2
 
     elapsed = (time.time_ns() - started_at) / 1_000_000_000
-    status = "PASS" if failed == 0 else "FAIL"
-    summary = {
+    status: Status = "PASS" if failed == 0 else "FAIL"
+    summary: dict[str, object] = {
         "status": status,
         "passed": passed,
         "failed": failed,
@@ -167,7 +170,12 @@ def junit_timestamp() -> str:
 def junit_xml_report(results: list[dict[str, object]], timestamp: str) -> bytes:
     tests = len(results)
     failures = sum(result["status"] == "FAIL" for result in results)
-    elapsed = sum(float(result["duration_seconds"]) for result in results)
+    elapsed = 0.0
+    for result in results:
+        duration = result["duration_seconds"]
+        if not isinstance(duration, (int, float)):
+            raise TypeError("command duration must be numeric")
+        elapsed += duration
     attributes = {
         "name": "uvcheck",
         "tests": str(tests),
@@ -181,13 +189,16 @@ def junit_xml_report(results: list[dict[str, object]], timestamp: str) -> bytes:
     for result in results:
         command = result["command"]
         assert isinstance(command, list)
+        duration = result["duration_seconds"]
+        if not isinstance(duration, (int, float)):
+            raise TypeError("command duration must be numeric")
         case = ET.SubElement(
             suite,
             "testcase",
             {
                 "classname": "uvcheck",
                 "name": shlex.join(command),
-                "time": f"{float(result['duration_seconds']):.6f}",
+                "time": f"{duration:.6f}",
             },
         )
         if result["status"] == "FAIL":
@@ -340,6 +351,8 @@ def run_with_progress(
         stderr=subprocess.PIPE,
         env=environment,
     )
+    assert process.stdout is not None
+    assert process.stderr is not None
     selector = selectors.DefaultSelector()
     selector.register(process.stdout, selectors.EVENT_READ, "stdout")
     selector.register(process.stderr, selectors.EVENT_READ, "stderr")
@@ -349,7 +362,7 @@ def run_with_progress(
 
     while selector.get_map():
         for key, _ in selector.select():
-            data = os.read(key.fileobj.fileno(), 4096)
+            data = os.read(key.fd, 4096)
             if not data:
                 selector.unregister(key.fileobj)
                 continue
@@ -432,7 +445,7 @@ def run(
         returncode = completed.returncode
 
     elapsed = time.perf_counter() - started
-    status = "PASS" if returncode == 0 else "FAIL"
+    status: Status = "PASS" if returncode == 0 else "FAIL"
 
     if xml_output and not json_output:
         if stdout:
@@ -444,7 +457,7 @@ def run(
             clear_progress_line()
         print_test_summary(stdout, stderr, returncode, is_pytest)
 
-    result = (
+    result: dict[str, object] | None = (
         {
             "command": [*runner, *command],
             "status": status,

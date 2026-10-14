@@ -107,11 +107,15 @@ class UvcheckTest(unittest.TestCase):
         self.assertEqual(report.attrib["failures"], "1")
         self.assertEqual(report.attrib["errors"], "0")
         self.assertRegex(report.attrib["timestamp"], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
-        self.assertEqual(report.find("testsuite").attrib["errors"], "0")
-        self.assertEqual(report.find("testsuite").attrib["timestamp"], report.attrib["timestamp"])
+        testsuite = report.find("testsuite")
+        assert testsuite is not None
+        self.assertEqual(testsuite.attrib["errors"], "0")
+        self.assertEqual(testsuite.attrib["timestamp"], report.attrib["timestamp"])
         cases = report.findall("./testsuite/testcase")
         self.assertEqual(cases[0].findtext("system-out"), "<configured>\n")
-        self.assertEqual(cases[1].find("failure").attrib["message"], "Command failed with exit code 3")
+        failure = cases[1].find("failure")
+        assert failure is not None
+        self.assertEqual(failure.attrib["message"], "Command failed with exit code 3")
         self.assertEqual(cases[1].findtext("system-err"), "bad & broken\n")
 
     def test_xml_single_command_writes_a_junit_report(self) -> None:
