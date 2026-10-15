@@ -5,6 +5,6 @@ edition = "2021"
 
 [dependencies]
 libc = "0.2"
-quick-xml = "0.38"
+quick-xml = "0.42"
 serde_json = "1"
 shlex = "1.3"
