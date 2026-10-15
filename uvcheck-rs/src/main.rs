@@ -395,13 +395,12 @@ fn display_command(command: &[String]) -> String {
     command
         .iter()
         .map(|argument| {
-            if argument
-                .chars()
-                .all(|character| character.is_ascii_alphanumeric() || "-._/".contains(character))
-            {
+            if argument.chars().all(|character| {
+                character.is_ascii_alphanumeric() || "_@%+=:,./-".contains(character)
+            }) {
                 argument.clone()
             } else {
-                format!("'{}'", argument.replace('\'', "'\\''"))
+                format!("'{}'", argument.replace('\'', "'\"'\"'"))
             }
         })
         .collect::<Vec<_>>()
@@ -858,6 +857,17 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn display_command_matches_python_shell_quoting() {
+        let command =
+            ["uv", "run", "python", "-c", "print('single')", "foo:bar"].map(str::to_string);
+
+        assert_eq!(
+            display_command(&command),
+            "uv run python -c 'print('\"'\"'single'\"'\"')' foo:bar"
+        );
+    }
 
     #[test]
     fn parses_python_session_state() {

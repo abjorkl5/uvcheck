@@ -220,8 +220,9 @@ running the configured checks, or place a command after the path to report a
 single check. `--junit-xml` requires `--json`.
 Each command is represented by a testcase with its duration, captured stdout
 and stderr, and a failure entry for nonzero exit codes. The suite timestamp is
-UTC in ISO-8601 format. JSON is emitted on stdout, and the command's exit
-status remains unchanged.
+UTC in ISO-8601 format. The XML report uses two-space indentation and a UTF-8
+declaration. JSON is emitted on stdout, and the command's exit status remains
+unchanged.
 
 ## Behavior
 

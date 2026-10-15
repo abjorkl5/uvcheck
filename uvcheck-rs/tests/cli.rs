@@ -221,6 +221,9 @@ fn junit_xml_single_command_writes_a_report_file() {
 
     assert!(completed.status.success());
     let xml = fs::read_to_string(&report_file).expect("failed to read JUnit report");
+    assert!(xml.starts_with("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"));
+    assert!(xml.contains("\n  <testsuite "));
+    assert!(xml.contains("\n    <testcase "));
     assert!(xml.contains("tests=\"1\""));
     assert!(xml.contains("<system-out>single"));
     fs::remove_file(report_file).expect("failed to remove JUnit report");

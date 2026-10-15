@@ -212,7 +212,9 @@ def junit_xml_report(results: list[dict[str, object]], timestamp: str) -> bytes:
             output = result[key]
             if output:
                 ET.SubElement(case, tag).text = str(output)
-    return ET.tostring(suites, encoding="utf-8", xml_declaration=True)
+    ET.indent(suites, space="  ")
+    declaration = b'<?xml version="1.0" encoding="UTF-8"?>\n'
+    return declaration + ET.tostring(suites, encoding="utf-8")
 
 
 def write_junit_xml(path: Path, results: list[dict[str, object]], timestamp: str) -> int:

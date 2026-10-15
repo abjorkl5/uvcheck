@@ -125,8 +125,18 @@ class UvcheckTest(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0)
         self.assertEqual(json.loads(result.stdout)["stdout"], "single\n")
+        xml = report_path.read_bytes()
+        self.assertTrue(xml.startswith(b'<?xml version="1.0" encoding="UTF-8"?>\n'))
+        self.assertIn(b"\n  <testsuite ", xml)
+        self.assertIn(b"\n    <testcase ", xml)
         report = ET.parse(report_path).getroot()
         self.assertEqual(report.attrib["tests"], "1")
+        testcase = report.find("./testsuite/testcase")
+        assert testcase is not None
+        self.assertEqual(
+            testcase.attrib["name"],
+            "uv run python -c 'print('\"'\"'single'\"'\"')'",
+        )
         self.assertEqual(report.findtext("./testsuite/testcase/system-out"), "single\n")
 
     def test_xml_requires_a_report_path(self) -> None:
